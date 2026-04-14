@@ -1,0 +1,51 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      POSTGRES_USER: sparkuser
+      POSTGRES_PASSWORD: sparkpass
+      POSTGRES_DB: sparkdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+      - ./source_data:/data
+    networks:
+      - spark-net
+
+  spark:
+    image: jupyter/pyspark-notebook:latest
+    container_name: spark
+    command: tail -f /dev/null  
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+    ports:
+      - "8888:8888"  
+      - "4040:4040"   
+    volumes:
+      - ./spark-apps:/home/jovyan/work
+      - ./jars:/home/jovyan/jars
+      - ./source_data:/home/jovyan/data
+    networks:
+      - spark-net
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8
+    container_name: clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    networks:
+      - spark-net
+
+volumes:
+  postgres_data:
+  clickhouse_data:
+
+networks:
+  spark-net:
+    driver: bridge

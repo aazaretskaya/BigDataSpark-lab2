@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+postgres_data/
+clickhouse_data/
+spark-warehouse/
+.ivy2/
