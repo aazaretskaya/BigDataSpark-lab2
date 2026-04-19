@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, row_number, lit
+from pyspark.sql.functions import col, row_number
 from pyspark.sql.window import Window
 
 PG_URL = "jdbc:postgresql://postgres:5432/sparkdb"
@@ -12,6 +12,9 @@ PG_PROPERTIES = {
 spark = SparkSession.builder \
     .appName("ETL Normalize to Snowflake") \
     .master("local[2]") \
+    .config("spark.driver.memory", "2g") \
+    .config("spark.executor.memory", "2g") \
+    .config("spark.sql.shuffle.partitions", "4") \
     .config("spark.jars", "/home/jovyan/jars/postgresql-42.7.10.jar,/home/jovyan/jars/clickhouse-jdbc-0.9.8-all.jar") \
     .getOrCreate()
 
@@ -39,6 +42,14 @@ cities_with_id = cities.join(countries_df, "country_name", "left") \
                        .select("city_name", "country_id")
 print(f"Cities count: {cities_with_id.count()}")
 cities_with_id.write.jdbc(url=PG_URL, table="dim_city", mode="append", properties=PG_PROPERTIES)
+
+city_country_lookup = spark.read.jdbc(url=PG_URL, table="dim_city", properties=PG_PROPERTIES) \
+    .join(countries_df.select("country_id", "country_name"), "country_id", "left") \
+    .select(
+        col("city_id"),
+        col("city_name").alias("city_name_lkp"),
+        col("country_name").alias("country_name_lkp")
+    )
 
 pet_types = df_raw.select("customer_pet_type").distinct() \
                   .withColumnRenamed("customer_pet_type", "pet_type_name") \
@@ -94,14 +105,19 @@ print(f"Sellers count: {sellers.count()}")
 sellers.write.jdbc(url=PG_URL, table="dim_seller", mode="append", properties=PG_PROPERTIES)
 
 cities_df = spark.read.jdbc(url=PG_URL, table="dim_city", properties=PG_PROPERTIES)
-window_supp = Window.partitionBy("supplier_name", "supplier_city").orderBy(col("supplier_email").desc())
+window_supp = Window.partitionBy("supplier_name", "supplier_city", "supplier_country").orderBy(col("supplier_email").desc())
 suppliers_dedup = df_raw.select(
     "supplier_name", "supplier_contact", "supplier_email",
-    "supplier_phone", "supplier_address", "supplier_city"
+    "supplier_phone", "supplier_address", "supplier_city", "supplier_country"
 ).withColumn("rn", row_number().over(window_supp)).filter("rn = 1").drop("rn")
 
 suppliers = suppliers_dedup \
- .join(cities_df, suppliers_dedup.supplier_city == cities_df.city_name, "left") \
+ .join(
+     city_country_lookup,
+     (suppliers_dedup.supplier_city == city_country_lookup.city_name_lkp) &
+     (suppliers_dedup.supplier_country == city_country_lookup.country_name_lkp),
+     "left"
+ ) \
  .select(
      col("supplier_name").alias("name"),
      col("supplier_contact").alias("contact"),
@@ -113,14 +129,19 @@ suppliers = suppliers_dedup \
 print(f"Suppliers count: {suppliers.count()}")
 suppliers.write.jdbc(url=PG_URL, table="dim_supplier", mode="append", properties=PG_PROPERTIES)
 
-window_store = Window.partitionBy("store_name", "store_city").orderBy(col("store_email").desc())
+window_store = Window.partitionBy("store_name", "store_city", "store_country").orderBy(col("store_email").desc())
 stores_dedup = df_raw.select(
     "store_name", "store_location", "store_state",
-    "store_phone", "store_email", "store_city"
+    "store_phone", "store_email", "store_city", "store_country"
 ).withColumn("rn", row_number().over(window_store)).filter("rn = 1").drop("rn")
 
 stores = stores_dedup \
- .join(cities_df, stores_dedup.store_city == cities_df.city_name, "left") \
+ .join(
+     city_country_lookup,
+     (stores_dedup.store_city == city_country_lookup.city_name_lkp) &
+     (stores_dedup.store_country == city_country_lookup.country_name_lkp),
+     "left"
+ ) \
  .select(
      col("store_name").alias("name"),
      col("store_location").alias("location"),
@@ -170,12 +191,46 @@ products = products_dedup \
 print(f"Products count: {products.count()}")
 products.write.jdbc(url=PG_URL, table="dim_product", mode="append", properties=PG_PROPERTIES)
 
-fact = df_raw.select(
+stores_lookup = spark.read.jdbc(url=PG_URL, table="dim_store", properties=PG_PROPERTIES) \
+    .join(city_country_lookup, "city_id", "left") \
+    .select(
+        col("store_id"),
+        col("name").alias("store_name_lkp"),
+        col("city_name_lkp").alias("store_city_lkp"),
+        col("country_name_lkp").alias("store_country_lkp")
+    )
+
+suppliers_lookup = spark.read.jdbc(url=PG_URL, table="dim_supplier", properties=PG_PROPERTIES) \
+    .join(city_country_lookup, "city_id", "left") \
+    .select(
+        col("supplier_id"),
+        col("name").alias("supplier_name_lkp"),
+        col("city_name_lkp").alias("supplier_city_lkp"),
+        col("country_name_lkp").alias("supplier_country_lkp")
+    )
+
+fact_source = df_raw \
+    .join(
+        stores_lookup,
+        (df_raw.store_name == stores_lookup.store_name_lkp) &
+        (df_raw.store_city == stores_lookup.store_city_lkp) &
+        (df_raw.store_country == stores_lookup.store_country_lkp),
+        "left"
+    ) \
+    .join(
+        suppliers_lookup,
+        (df_raw.supplier_name == suppliers_lookup.supplier_name_lkp) &
+        (df_raw.supplier_city == suppliers_lookup.supplier_city_lkp) &
+        (df_raw.supplier_country == suppliers_lookup.supplier_country_lkp),
+        "left"
+    )
+
+fact = fact_source.select(
     col("sale_date").alias("sale_date"),
     col("sale_customer_id").alias("customer_id"),
     col("sale_seller_id").alias("seller_id"),
-    lit(None).cast("int").alias("supplier_id"),
-    lit(None).cast("int").alias("store_id"),
+    col("supplier_id").cast("int").alias("supplier_id"),
+    col("store_id").cast("int").alias("store_id"),
     col("sale_product_id").alias("product_id"),
     col("sale_quantity").alias("quantity"),
     col("sale_total_price").alias("total_price")
